@@ -211,16 +211,30 @@ function processRows(rows,COL){
   }
   const order=[],groups={};
   rows.forEach((r,i)=>{ const v=r[INV]; if(!(v in groups)){groups[v]=[];order.push(v);} groups[v].push(i); });
-  const readyInv=[],balancedInv=[],pendingInv=[];
+  const readyInv=[],roundOnlyInv=[],balancedInv=[],pendingInv=[];
   for(const v of order){ const idx=groups[v], hasB=idx.some(i=>meta[i].cls==='B');
     if(!hasB){ idx.forEach(i=>{ if(meta[i].cls==='A') applyLine(i,meta[i].T); }); readyInv.push(v); continue; }
+    // Try round-only first: round each discount to 1 decimal, leave unit prices untouched.
+    // Accept only if the invoice's total IVA and total Total both stay exactly equal.
+    const roDc=idx.map(i=>Math.round(meta[i].Dc/10)*10);
+    const roT =idx.map((i,k)=>meta[i].C*meta[i].PUc - roDc[k]);
+    const sumT =idx.reduce((s,i)=>s+meta[i].T,0);
+    const sumTro=roT.reduce((a,b)=>a+b,0);
+    const sumIVAf=idx.reduce((s,i)=>s+meta[i].ivaF,0);
+    const sumIVAro=idx.reduce((s,i,k)=>s+ivac(roT[k],meta[i].tasa),0);
+    if(sumTro===sumT && sumIVAro===sumIVAf && roDc.every((d,k)=>d>=0 && roT[k]>=0)){
+      idx.forEach((i,k)=>{ const niva=ivac(roT[k],meta[i].tasa);
+        out[i][DESC]=centsToStr(roDc[k]); out[i][IVA]=centsToStr(niva); out[i][TOT]=centsToStr(roT[k]+niva);
+      }); // PU and Subtotal left exactly as the original
+      readyInv.push(v); roundOnlyInv.push(v); continue;
+    }
     const lines=idx.map(i=>Object.assign({i:i},meta[i]));
-    const G=lines.reduce((a,l)=>gcd(a,l.g),0), sumT=lines.reduce((s,l)=>s+l.T,0);
+    const G=lines.reduce((a,l)=>gcd(a,l.g),0);
     let combo=null; if(lines.length>1 && sumT%G===0) combo=balance(lines);
     if(combo){ lines.forEach((l,k)=>applyLine(l.i,combo[k])); balancedInv.push(v); readyInv.push(v); }
     else pendingInv.push(v);
   }
-  return {out:out,anomalies:anomalies,readyInv:readyInv,balancedInv:balancedInv,pendingInv:pendingInv,groups:groups};
+  return {out:out,anomalies:anomalies,readyInv:readyInv,roundOnlyInv:roundOnlyInv,balancedInv:balancedInv,pendingInv:pendingInv,groups:groups};
 }
 
 /* ================= CSV parse / build ================= */
@@ -280,8 +294,15 @@ function run(name,text){
 
   const R=processRows(data,COL);
   const totInv=Object.keys(R.groups).length;
+  const MAIL='Mail';
   const readyRows=[], pendRows=[];
-  data.forEach((_,i)=>{ (R.pendingInv.indexOf(data[i][COL.INV])>=0?pendRows:readyRows).push(R.out[i]); });
+  data.forEach((_,i)=>{
+    if(R.pendingInv.indexOf(data[i][COL.INV])>=0){
+      const row=Object.assign({},R.out[i]);
+      if(MAIL in row) row[MAIL]='';   // clear customer email so an accidental upload won't send a wrong invoice
+      pendRows.push(row);
+    } else readyRows.push(R.out[i]);
+  });
 
   const stem=name.replace(/\.csv$/i,'');
   blobs.readyName=stem+'__ready_to_upload.csv';
@@ -295,12 +316,13 @@ function run(name,text){
   $('nPend').textContent=R.pendingInv.length;
   $('readyMeta').textContent=readyRows.length+' rows · every invoice \u2211IVA and \u2211Total exact'+
     (R.balancedInv.length?' · incl. '+R.balancedInv.length+' balanced at invoice level':'');
-  $('pendMeta').textContent=pendRows.length?pendRows.length+' rows · exported unchanged for manual invoicing':'None';
+  $('pendMeta').textContent=pendRows.length?pendRows.length+' rows · Mail cleared · for manual invoicing':'None';
 
   let notes='';
   if(R.anomalies.length){ notes+='<div class="note"><span class="tag w">CHECK</span><div>The file has '+R.anomalies.length+' rows with arithmetic mismatches (rows '+R.anomalies.map(a=>a.row).join(', ')+'). Worth checking at the source. Where the invoice is processable, the tool recomputes them from quantity \u00D7 unit price.</div></div>'; }
-  if(R.pendingInv.length){ notes+='<div class="note"><span class="tag b">MANUAL</span><div>Invoices '+R.pendingInv.join(', ')+': every line quantity is a multiple of 2 or 5, so even the invoice total can\u2019t reach zero error at 2 decimals. Exported unchanged \u2014 issue these by hand.</div></div>'; }
-  if(R.balancedInv.length){ notes+='<div class="note"><span class="tag i">BALANCED</span><div>Invoices '+R.balancedInv.join(', ')+': a few lines\u2019 IVA differ by cents but cancel within the invoice, so each invoice\u2019s \u2211IVA and \u2211Total match the original.</div></div>'; }
+  if(R.pendingInv.length){ notes+='<div class="note"><span class="tag b">MANUAL</span><div>Invoices '+R.pendingInv.join(', ')+': every line quantity is a multiple of 2 or 5, so even the invoice total can\u2019t reach zero error at 2 decimals. Exported unchanged, but with the Mail column cleared so an accidental upload can\u2019t email a wrong invoice to the customer \u2014 issue these by hand.</div></div>'; }
+  if(R.roundOnlyInv&&R.roundOnlyInv.length){ notes+='<div class="note"><span class="tag i">ROUNDED</span><div>Invoices '+R.roundOnlyInv.join(', ')+': fixed by rounding the discount to 1 decimal only \u2014 unit prices left untouched, and the invoice\u2019s \u2211IVA and \u2211Total stay exactly the same.</div></div>'; }
+  if(R.balancedInv.length){ notes+='<div class="note"><span class="tag i">BALANCED</span><div>Invoices '+R.balancedInv.join(', ')+': a few lines got a small unit-price tweak so their IVA cents cancel within the invoice; each invoice\u2019s \u2211IVA and \u2211Total still match the original.</div></div>'; }
   $('notes').innerHTML=notes;
 
   $('dlPend').disabled=!blobs.pend;
